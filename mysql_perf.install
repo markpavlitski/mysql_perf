@@ -1,0 +1,97 @@
+<?php
+
+/**
+ * Implements hook_schema().
+ */
+function mysql_perf_schema() {
+  $schema['mysql_perf_raw'] = array(
+    'description' => '',
+    'fields' => array(
+      'qid' => array(
+        'description' => 'The primary key of this query.',
+        'type' => 'serial',
+        'default' => 0,
+        'not null' => TRUE,
+      ),
+      'uuid' => array(
+        'description' => 'The unique ID of this page request.',
+        'type' => 'varchar',
+        'length' => 43,
+        'not null' => TRUE,
+      ),
+      'url' => array(
+        'description' => 'The page request url.',
+        'type' => 'text',
+        'not null' => TRUE,
+      ),
+      'timestamp' => array(
+        'description' => 'The page request time.',
+        'type' => 'text',
+        'not null' => TRUE,
+      ),
+      'query_number' => array(
+        'description' => 'The order the query was run in the page request.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'execution_time' => array(
+        'description' => 'How long the query took to run.',
+        'type' => 'float',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'caller' => array(
+        'description' => 'The name of the calling function.',
+        'type' => 'text',
+        'not null' => TRUE,
+      ),
+      'query' => array(
+        'description' => 'The query that was run.',
+        'type' => 'text',
+        'not null' => TRUE,
+      ),
+      'type' => array(
+        'description' => 'The type of query.',
+        'type' => 'varchar',
+        'length' => 12,
+        'not null' => TRUE,
+      ),
+      'query_raw' => array(
+        'description' => 'The raw (unprocessed) query string.',
+        'type' => 'blob',
+        'not null' => TRUE,
+      ),
+      'query_args' => array(
+        'description' => 'The query arguments (serialized).',
+        'type' => 'blob',
+        'mysql_type' => 'longblob',
+        'not null' => TRUE,
+        'default' => '',
+      ),
+    ),
+    'indexes' => array(
+    ),
+    'unique keys' => array(
+    ),
+    'primary key' => array('qid'),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implements hook_update_N().
+ */
+function mysql_perf_update_7001(&$sandbox = NULL) {
+  $ret = array();
+
+  $schema = mysql_perf_schema();
+  foreach ($schema as $name => $table) {
+    if (!db_table_exists($name)) {
+      db_create_table($name, $table);
+    }
+  }
+
+  return $ret;
+}

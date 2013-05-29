@@ -1,0 +1,217 @@
+<?php
+
+define('MYSQL_PERF_QUERY_CHUNK', 100);
+
+/**
+ * Implements hook_boot().
+ */
+function mysql_perf_boot() {
+  global $databases;
+
+  if (variable_get('mysql_perf_stats_ignore_cron', TRUE) && ($_GET['q'] === 'admin/reports/status/run-cron' || substr(request_uri(), 0, 9) === '/cron.php')) {
+    // Skip cron runs.
+    return;
+  }
+  elseif (variable_get('mysql_perf_stats_ignore_cli', TRUE) && drupal_is_cli()) {
+    // Skip CLI requests (e.g. Drush).
+    return;
+  }
+  elseif (variable_get('mysql_perf_stats_ignore_admin', TRUE) && (arg(0) === 'admin' || arg(0) === 'admin_menu' || arg(1) === 'admin_menu')) {
+    // Skip administration pages.
+    return;
+  }
+
+  register_shutdown_function('mysql_perf_shutdown');
+  @include_once DRUPAL_ROOT . '/includes/database/log.inc';
+  Database::startLog('mysql_perf');
+}
+
+/**
+ * Shutdown function that collects all performance data.
+ */
+function mysql_perf_shutdown() {
+  if ($log = Database::getLog('mysql_perf')) {
+    $queue = DrupalQueue::get('mysql_perf_raw');
+    $queue->createQueue();
+
+    $url = implode('/', arg());
+    if (drupal_is_front_page()) {
+      $url = '<front>';
+    }
+    $uuid = drupal_hash_base64(uniqid(mt_rand(), TRUE) . mt_rand());
+    foreach (array_chunk($log, MYSQL_PERF_QUERY_CHUNK, TRUE) as $queries) {
+      $item = new stdclass();
+      $item->url = $url;
+      $item->uuid = $uuid;
+      $item->timestamp = REQUEST_TIME;
+      $item->queries = $queries;
+      $queue->createItem($item);
+      unset($item);
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function mysql_perf_cron() {
+  if ($expire = variable_get('mysql_perf_entries_expire', 604800)) {
+    db_query("DELETE FROM {mysql_perf_raw WHERE timestamp < :timestamp", array(':timestamp' => REQUEST_TIME - 604800));
+  }
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function mysql_perf_cron_queue_info() {
+  $queues['mysql_perf_raw'] = array(
+    'worker callback' => 'mysql_perf_raw_queue_process',
+    'time' => 30,
+  );
+  return $queues;
+}
+
+function mysql_perf_raw_queue_process($item) {
+  $table = 'mysql_perf_raw';
+  $fields = array('uuid', 'url', 'timestamp', 'query_number', 'execution_time', 'caller', 'query', 'query_raw', 'query_args');
+
+  foreach (array_chunk($item->queries, MYSQL_PERF_QUERY_CHUNK, TRUE) as $index => $queries) {
+    // Create our query object.
+    $insert = db_insert($table)->fields($fields);
+    // Reset the number of values to be inserted.
+
+    foreach ($queries as $key => $query) {
+      $query_string = $query['query'];
+      if (strpos($query_string, 'INSERT INTO mysql_perf') !== FALSE) {
+        // Skip our own queries.
+        continue;
+      }
+      if (strpos($query_string, 'FROM mysql_perf_raw') !== FALSE) {
+        // Skip our own queries.
+        continue;
+      }
+      // Strip out IN() parameter lists, to ensure similiar queries with
+      // different number of arguments can be aggregated.
+      $query_string = preg_replace('/IN\s*\((?::[\w]+,\s)*:([\w]+)_\d+[^\)]*\)/', 'IN (:${1}_X)', $query_string);
+
+      // Add our insert values.
+      $insert->values(array(
+        'uuid' => $item->uuid,
+        'url' => is_array($item->url) ? implode('/', $item->url) : (string)$item->url,
+        'timestamp' => $item->timestamp,
+        'query_number' => $key,
+        'execution_time' => $query['time'],
+        'caller' => ((!empty($query['caller']['class']) ? $query['caller']['class'] . '::' : '') . $query['caller']['function']),
+        'query' => $query_string,
+        'type' => _mysql_perf_query_type($query_string),
+        'query_raw' => $query['query'],
+        'query_args' => !empty($query['args']) ? serialize($query['args']) : serialize(array()),
+      ));
+    }
+
+    // Run the query.
+    $insert->execute();
+  }
+}
+
+function _mysql_perf_sanitise_query($query_string) {
+  return preg_replace('/:[a-zA-Z0-9_]+/', "'PARAM'", $query_string);
+}
+
+function _mysql_perf_query_type($query) {
+  $query_type = '';
+  if (is_object($query)) {
+    $query_string = $query->query;
+    if (!empty($query->type)) {
+      $query_type = $query->type;
+    }
+  }
+  else {
+    $query_string = $query;
+  }
+
+  if (empty($query_type)) {
+    list($query_type) = explode(' ', trim($query_string), 2);
+  }
+  return strtoupper($query_type);
+}
+
+/**
+ * Implements hook_permission().
+ */
+function mysql_perf_permission() {
+   return array(
+    'view mysql_perf reports' => array(
+      'title' => t('View MySQL Performance Reports'),
+      'description' => t(''),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function mysql_perf_menu() {
+  $items = array();
+
+  $items['admin/reports/mysql_perf'] = array(
+    'title' => 'MySQL Performance Report',
+    'description' => 'View MySQL performance reports.',
+    'page callback' => 'mysql_perf_report',
+    'file' => 'mysql_perf.pages.inc',
+    'access arguments' => array('view mysql_perf reports'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  $items['admin/reports/mysql_perf/%mysql_perf_qid'] = array(
+    'title' => 'MySQL Performance Report',
+    'description' => 'View MySQL performance report.',
+    'page callback' => 'mysql_perf_query_report',
+    'page arguments' => array(3),
+    'file' => 'mysql_perf.pages.inc',
+    'access arguments' => array('view mysql_perf reports'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+function mysql_perf_qid_load($qid) {
+  $query = db_query("SELECT * FROM {mysql_perf_raw} WHERE qid = :qid LIMIT 1", array(':qid' => $qid))->fetchObject();
+  $query->query_args = unserialize($query->query_args);
+  return $query;
+}
+
+function _mysql_perf_query_substitute($query) {
+  $args = array();
+  foreach ($query->query_args as $key => $val) {
+    switch (gettype($val)) {
+      case 'integer':
+      case 'double':
+        $args[$key] = $val;
+        break;
+      case 'string':
+        $args[$key] = "'" . $val . "'";
+        break;
+      case 'NULL':
+        $args[$key] = 'NULL';
+        break;
+      default:
+        $args[$key] = "'" . (string)$val . "'";
+        break;
+    }
+  }
+
+  return strtr($query->query_raw, $args);
+}
+
+/**
+ * Implements hook_theme().
+ */
+function mysql_perf_theme($existing, $type, $theme, $path) {
+  return array(
+    'mysql_perf_query' => array(
+      'variables' => array('qid' => NULL, 'query_string' => NULL, 'options' => array()),
+      'file' => 'mysql_perf.theme.inc',
+    ),
+  );
+}
